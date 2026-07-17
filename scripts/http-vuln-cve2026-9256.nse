@@ -1,15 +1,13 @@
 local http = require "http"
 local shortport = require "shortport"
 local vulns = require "vulns"
-local stdnse = require "stdnse"
 local string = require "string"
 
 description = [[
-Detects NGINX servers vulnerable to CVE-2026-9256, a heap-based buffer
-overflow in the ngx_http_rewrite_module. Affects NGINX Open Source 1.0.0
-through 1.30.1 and version 1.31.0, and various NGINX Plus releases. An
-unauthenticated attacker can trigger a heap buffer overflow via crafted
-HTTP requests using overlapping PCRE captures.
+Performs a safe, detection-only check for CVE-2026-9256, a heap-based
+buffer overflow in ngx_http_rewrite_module. The script classifies likely
+vulnerability from reported NGINX version information and does not attempt
+exploitation.
 ]]
 
 ---
@@ -22,7 +20,7 @@ HTTP requests using overlapping PCRE captures.
 -- | http-vuln-cve2026-9256:
 -- |   VULNERABLE:
 -- |   NGINX ngx_http_rewrite_module Heap Buffer Overflow
--- |     State: VULNERABLE
+-- |     State: LIKELY VULNERABLE
 -- |     IDs:  CVE:CVE-2026-9256
 -- |     Risk factor: HIGH
 -- |     Description:
@@ -40,10 +38,19 @@ categories = {"vuln", "safe"}
 portrule = shortport.http
 
 local function parse_version(ver_str)
+  if type(ver_str) ~= "string" or not ver_str:match("^%d+%.%d+[%d%.]*$") then
+    return nil
+  end
+
   local parts = {}
   for part in string.gmatch(ver_str, "%d+") do
     parts[#parts + 1] = tonumber(part)
   end
+
+  if #parts < 2 then
+    return nil
+  end
+
   return parts
 end
 
@@ -58,6 +65,48 @@ end
 
 local function version_gte(a, b)
   return not version_lt(a, b)
+end
+
+local function get_server_header(response)
+  if not response or type(response.header) ~= "table" then
+    return nil
+  end
+
+  return response.header["server"] or response.header["Server"]
+end
+
+local function extract_nginx_version(server_header)
+  if type(server_header) ~= "string" then
+    return nil
+  end
+
+  return server_header:match("^%s*[Nn][Gg][Ii][Nn][Xx]/([%d%.]+)%f[^%d%.]")
+end
+
+local function extract_port_version(port)
+  if not port or type(port.version) ~= "table" then
+    return nil
+  end
+
+  local product = port.version.product
+  local version = port.version.version
+  if type(product) ~= "string" or type(version) ~= "string" then
+    return nil
+  end
+
+  if not product:lower():find("nginx", 1, true) then
+    return nil
+  end
+
+  return version
+end
+
+local function fetch_response(host, port, path)
+  local response = http.head(host, port, path, { bypass_cache = true })
+  if not response or not response.status or response.status == 405 then
+    response = http.get(host, port, path, { bypass_cache = true })
+  end
+  return response
 end
 
 action = function(host, port)
@@ -86,32 +135,42 @@ occur, potentially allowing denial of service or remote code execution.
 
   local vuln_report = vulns.Report:new(SCRIPT_NAME, host, port)
 
-  local response = http.get(host, port, "/")
+  local response = fetch_response(host, port, "/")
   if not response or not response.status then
     return vuln_report:make_output(vuln)
   end
 
-  local server_header = response.header["server"]
-  if not server_header then
+  local server_header = get_server_header(response)
+  local ver_str = extract_nginx_version(server_header)
+  local source = "Server header"
+  local port_ver_str = extract_port_version(port)
+
+  if not ver_str and port_ver_str then
+    ver_str = port_ver_str
+    source = "service detection"
+  elseif ver_str and port_ver_str and ver_str ~= port_ver_str then
     return vuln_report:make_output(vuln)
   end
 
-  local ver_str = string.match(server_header, "nginx/([%d.]+)")
   if not ver_str then
     return vuln_report:make_output(vuln)
   end
 
   local ver = parse_version(ver_str)
-  if #ver < 2 then
+  if not ver then
     return vuln_report:make_output(vuln)
   end
 
+  local min_ver = parse_version("1.0.0")
+  local max_fixed_ver = parse_version("1.30.2")
+
   -- Affected: 1.0.0 <= ver < 1.30.2, or ver == 1.31.0
-  if version_gte(ver, parse_version("1.0.0")) and
-     version_lt(ver, parse_version("1.30.2")) then
-    vuln.state = vulns.STATE.VULN
+  if version_gte(ver, min_ver) and version_lt(ver, max_fixed_ver) then
+    vuln.state = vulns.STATE.LIKELY_VULN
+    vuln.check_results = string.format("Detected nginx version %s (%s).", ver_str, source)
   elseif ver[1] == 1 and ver[2] == 31 and (ver[3] or 0) == 0 then
-    vuln.state = vulns.STATE.VULN
+    vuln.state = vulns.STATE.LIKELY_VULN
+    vuln.check_results = string.format("Detected nginx version %s (%s).", ver_str, source)
   end
 
   return vuln_report:make_output(vuln)
